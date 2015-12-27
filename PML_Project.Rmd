@@ -1,0 +1,240 @@
+---
+title: "Machine Learning Course Project"
+date: "Dec 27, 2015"
+output:
+  html_document:
+    toc: yes
+---
+
+## Summary
+
+The following analysis will train three machine learning models using the training data from the pml-training.csv file and test its predictive abilities on the testing data from the pml-testing.csv file. The goal is to predict the manner in which the participants performed their exercise. Note to the reader, the actual R output percentages may be slightly different than the percentages in the writeup because the R code was run prior to completing this R Markdown document. Since this is a classification problem, the "RMSE" metric is not used, and a simple error metric (1.0 - Accuracy Rate) is used instead.
+
+## Load Libraries and Prepare Multicore Processing
+
+This analysis was performed on an 8 core workstation with 32GB of RAM. At its peak, the analysis consumed nearly 10GB of RAM. If the reader were to run this analysis, please do so on a workstation with enough memory. The parallel library was used to exploit multiple cores in the analysis. If the reader were to run this analysis, please adjust the number of clusters/core to match your workstation's specification. The following libraries below are required for this analysis. 
+
+```{r cache = TRUE,warning=FALSE, message=FALSE}
+library(rlist)
+library(caret)
+library(data.table)
+library(dplyr)
+library(randomForest)
+library(ggplot2)
+library(parallel)
+library(doParallel)
+registerDoParallel(makeCluster(8, type = 'SOCK'))
+```
+
+## Loading the Data Set
+
+The training and testing files were downloaded and placed on a local drive. The files are loaded from the local drive for convenience and to reduce data loading time. The classification labels from the training data set are shown below. There are five unique output labels.
+
+```{r cache = TRUE,warning=FALSE, message=FALSE}
+setwd("D:/coursera/pml")
+train.data <- read.csv("pml-training.csv", header = TRUE, na.strings=c("","NA", "#DIV/0!"))
+test.data <- read.csv("pml-testing.csv", header = TRUE, na.strings=c("","NA", "#DIV/0!"))
+levels(train.data$classe)
+```
+## Helper Functions
+
+The converNumeric function is used convert vectors to numeric types. The pml_write_files function is used to output
+the results of trained models on the test data sets to external text files.
+
+```{r cache = TRUE, message=FALSE,warning=FALSE}
+convertNumeric <- function(x){ for(i in 1:(length(x)-1)){x[,i] <- as.numeric(x[,i])}
+  return (x) }
+
+pml_write_files <- function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+```
+## Data Set Preparation
+
+Before training and using the models, the raw datasets need to be cleaned. The raw datasets contain N/A values. More specifically, some columns in both data sets contain all N/A values. Those columns are identified and removed with the following code. The number of columns/variables were reduced from 160 to 60 including the output variable, "classe". The reduced column/variable names are presented below.
+
+```{r cache = TRUE, message=FALSE,warning=FALSE}
+naColumns <- sapply(train.data, function (x) any(is.na(x) | x == ""))
+valid.columns <- names(naColumns[naColumns==FALSE])
+valid.columns
+```
+The number of columns/variables are further reduced by removing the first seven columns. These variables are related to time stamps, username, and other non-essential predictors. The corresponding columns with the exception of the "classe" variables are removed from the test data. Both the training and testing data are converted to numeric. 
+
+```{r cache = TRUE, message=FALSE,warning=FALSE}
+train.columns <- valid.columns[-(1:7)]
+test.columns <-  valid.columns[-(1:7)]
+test.columns <- test.columns[-53] #The "classe" column/variable is not present in the testing data
+
+train.data <- train.data[,train.columns] %>% convertNumeric
+test.data <- test.data[,test.columns] %>% convertNumeric
+```
+
+## Create training and validation/testing subsets
+
+From the training dataset, two subsets are created to train the models and to test the models. The testing subset contains 70% of the original testing dataset and the validation/test subset contains the other 30%. Note to the reader, the author calls the testing subset in this simple cross validation the "validation subset"" to avoid confusion with the testing data from the pml-testing.csv file.
+
+```{r cache = TRUE, message=FALSE,warning=FALSE}
+set.seed(5134)
+train.index <- createDataPartition(y=train.data$classe, p=0.7, list=FALSE)
+training.subset <- train.data[train.index,]   #Training Subset
+validation.subset <- train.data[-train.index,]  #Validation/Testing Subset
+```
+
+## Dimension Reduction through Principal Component Analysis
+
+The number of columns/variables are still too excessive. We want to reduce the dimensionality of the problem by using principal component analysis on the training subset. We plot a scree diagram and a cumulative proportional variance diagram below. From the scree plot, the first 10 eigenvalues are significant. Morever, on the second diagram, we see that the first 10 principal components explain 96% of the variance in the training subset. The first 18, 28, and 32 principal components explain 99.1%, 99.92%, & 99.98% of the variance in the training subset, respectively. The exact percentages are found in the activity.pca.propvar variable.
+
+```{r cache = TRUE, message=FALSE,warning=FALSE}
+activity.pca <- prcomp(training.subset[,-53], retx=TRUE, scale. = FALSE, center=TRUE)
+activity.pca.data <- data.frame(PC=1:length(activity.pca$sdev), Variance=activity.pca$sdev^2)
+activity.pca.propvar <- (activity.pca$sdev^2/sum(activity.pca$sdev^2)) %>% cumsum
+## Add back the original output labels to the 18 pca data frame
+activity.pca.propvar <- data.frame(x=1:length(activity.pca.propvar), cumvar=activity.pca.propvar)
+
+g1<-ggplot(activity.pca.data, aes(x=PC, y=Variance))+
+  geom_point() + 
+  geom_line() + 
+  xlab("Factor Number")+
+  ylab("Eigenvalue")+
+  theme(legend.position = "none") +
+  ggtitle("Scree Plot") + 
+  theme_bw()
+
+g2<-ggplot(activity.pca.propvar, aes(x=x, y=cumvar))+
+  geom_bar(stat="identity") +
+  xlab("Number of Components")+
+  ylab("Proportion of Variance Explained")+
+  theme_bw()
+
+plot(g1)
+plot(g2)
+```
+
+Instead of using the original testing subset, we use the first 18 principal components i.e. the eigenvectors of the covariance matrix of the original testing subset. To prevent cheating and bias in the training of the models, Principal Component Analysis is only applied to the training subset. This produces a vector of centers for each of the principal components along with a rotation matrix. The vector of centers/means is subtracted from each component for every observation in the validation subset to apply zero mean centering. To apply the transformation from the training subset, the rotation matrix is applied to the zero mean validation matrix to produce corresponding principal component matrices that are analogous to the training subset's PC matrix.  
+
+```{r cache = TRUE, message=FALSE,warning=FALSE}
+#nPCA = 32
+#nPCA = 20
+#nPCA = 28
+nPCA = 18
+## We use the principal components of the dataset instead of the original dataset
+training.subset.pca <- cbind(as.data.frame(activity.pca$x[,1:nPCA]), classe=training.subset$classe)
+
+# Apply Zero Centering and Rotation to Validation test using the same transformation from the training set
+#subtract mean of each component from the observations and multiple by rotation matrix from testing subset
+tmp <-  sweep(validation.subset[,1:52],2,activity.pca$center) 
+validation.subset.pca <- as.matrix(tmp) %*% activity.pca$rotation
+# Add the output lables from the original validation subset
+validation.subset.pca <- cbind(as.data.frame(validation.subset.pca[,1:nPCA]), classe=validation.subset$classe)
+```
+
+## Random Forest on PCA Data
+
+A random forest model is trained using the first 18 principal components of the testing subset. The caret package is used for convenience with a 5 fold cross validation scheme to train the random forest model. The best trained random forest model gives an accuracy of 96.65852% on the pca training subset. The error on the training subset is 3.3415%. The sample sizes for the cross validation subsets are presented below. To test the accuracy of the trained random forest model, the first 18 principal componets of the validation subset are used as predictors. We analyze the results using a confusion matrix and see that the accuracy of the trained model on the validation subset is quite good at 97.47%. The out of sample error is 2.53%.
+
+```{r cache = TRUE, message=FALSE,warning=FALSE}
+#########RF#########################
+set.seed(1299)
+rf.model.pca <- train(classe~., data = training.subset.pca, method ="rf", metric = "Accuracy", trControl=trainControl(method="cv", number = 5))
+rf.model.pca
+# use model to predict on validation data set
+rf.prediction.pca <- predict(rf.model.pca, validation.subset.pca)
+# predicted result
+confusionMatrix(rf.prediction.pca, validation.subset.pca$classe)
+```
+
+## K-Nearest Neighbors on PCA Data
+
+A KNN model is trained using the first 18 principal componets of the testing subset and a 5 fold cross validation scheme. The optimal model is when k = 5. This gives an accuracy of 89.13156% on the pca training subset. The error on the training subset is 10.8684%. The trained KNN model is used to test the first 18 principal componets of the validation subset. We analyze the results using a confusion matrix and see that the accuracy of the trained model on the validation subset is 88.46%. The out of sample error is 11.54%. The KNN model does not perform as well as the Random Forest model.   
+
+```{r cache = TRUE, message=FALSE,warning=FALSE}
+set.seed(3521)
+knn.model.pca <- train(classe~., data = training.subset.pca, method ="knn", metric = "Accuracy", trControl=trainControl(method="cv", number = 5))
+knn.model.pca
+knn.predictionPCA <- predict(knn.model.pca, validation.subset.pca)
+confusionMatrix(knn.predictionPCA, validation.subset.pca$classe)
+```
+
+## Gradient Boosting on PCA Data
+
+The ensemble learner, Stochastic Gradient Boosting,is trained using the same pca test subset with a 5 fold cross validation. This gives an accuracy of 81.58256% on the pca training subset. The error on the training subset is 18.41744%. The trained GBM model is tested against the PCA validation subset and achieved an accuracy of 82.55%. The out of sample error is 17.45%. The GBM model did not perform as well as either the Random Forest or KNN models. The number of principal components were increased from 20 to 28, and 32 for the training and validation subset. However, the model  was never able to achieve accuracy greater than 88% on either the training or validation subset. The outputs of using increasing number of principal components are not show for brevity. 
+
+```{r cache = TRUE,results='hide', message=FALSE,warning=FALSE}
+set.seed(5287)
+gbm.model.pca <- train(classe~., data = training.subset.pca, method ="gbm", metric = "Accuracy", trControl=trainControl(method="cv", number = 5))
+```
+
+```{r cache = TRUE,message=FALSE,warning=FALSE}
+gbm.model.pca
+# use model to predict on validation data set
+gbm.predictionPCA <- predict(gbm.model.pca, validation.subset.pca)
+# predicted result
+confusionMatrix(gbm.predictionPCA, validation.subset.pca$classe)
+```
+
+For Comparison purposes, the Stochastic Gradient Boosting model was trained using the original training subset with 5 fold cross validation.  This gives an accuracy of 95.88% on the training subset. The error on the training subset is 4.12%. The accuracy of the trained model on the validation subset is 96.04%. The out of sample error is 3.96%. The outputs of the GBM model and confusion matrix are not shown for brevity. 
+
+```{r cache = TRUE,results='hide',message=FALSE,warning=FALSE}
+set.seed(5287)
+gbm.model <- train(classe~., data = training.subset, method ="gbm", metric = "Accuracy", trControl=trainControl(method="cv", number = 5))
+gbm.model
+gbm.prediction <- predict(gbm.model, validation.subset)
+confusionMatrix(gbm.prediction, validation.subset$classe)
+```
+
+## Testing Data Set
+
+The vector of means/centers from the training subset is subtracted from each component for every observation in the training data to apply zero mean centering. To apply the transformation from the training subset, the rotation matrix is applied to the zero mean testing matrix to produce corresponding principal component matrices that are analogous to the training subset's PC matrix. 
+
+```{r cache = TRUE, results='hide', message=FALSE, warning=FALSE}
+tmp <-  sweep(test.data[,1:52],2,activity.pca$center) ##subtract mean of each component from the observations
+test.data.pca <- as.matrix(tmp) %*% activity.pca$rotation
+test.data.pca <- as.data.frame(test.data.pca[,1:nPCA])
+```
+We run the transformed pca tesing data through the random forest, k-nearest neighbor, and stochastic gradient boosting models. From the results below, it seems that the random forest and KNN were able to produce idential predictions, while the boosting model produced slightly different predictions. The author submitted the results from the random forest prediction, and they were all correct. This implies that the predictions from the KNN model was also correct. The predictions for the 20 test cases are shown below.
+
+```{r cache = TRUE,message=FALSE,warning=FALSE}
+rf.test.subset.pca.output <- predict(rf.model.pca, test.data.pca)
+knn.test.subset.pca.output <- predict(knn.model.pca, test.data.pca)
+gbm.test.subset.pca.output <- predict(gbm.model.pca, test.data.pca)
+
+rf.test.subset.pca.output
+knn.test.subset.pca.output
+gbm.test.subset.pca.output
+
+identical(rf.test.subset.pca.output,gbm.test.subset.pca.output)
+identical(rf.test.subset.pca.output,knn.test.subset.pca.output)
+identical(gbm.test.subset.pca.output,knn.test.subset.pca.output)
+```
+For completeness, the original non-pca testing data set was run through the vanilla non-pca stochastic boosting model and the model was able to produce accurate predictions similar to those of the pca random forest and pca KNN models.
+
+```{r cache = TRUE, message=FALSE,warning=FALSE}
+gbm.test.subset.output <- predict(gbm.model, test.data)
+gbm.test.subset.output
+
+identical(gbm.test.subset.output,gbm.test.subset.pca.output)
+identical(rf.test.subset.pca.output,gbm.test.subset.output)
+identical(gbm.test.subset.output,knn.test.subset.pca.output)
+```
+
+## Conclusion
+
+After cleaning the original training and testing datasets and removing unnecessary variables/columns, principal component analysis was performed on the remaining variables. The number of variables were reduced from 52 to 18. After performing the same transformation to the validation subset & original testing data, and training the three models on the reduced pca subset with 5 fold cross validation, we showed that both the random forest and KNN models were able to accurately predict the 20 test cases from the testing data. However, the stochastic gradient boosting model was not able to produce accurate predictions despite training with an increasing number of principal components on the training subset (i.e. 20,28,32 principal componets). The stochastic gradient boosting algorithm was only able to produce an accurate prediction when it was trained on the original non-pca training subset and non-pca testing set.  
+
+The PCA KNN experiment showed a bit of bias in the training, as the out of sample error seemed a bit larger than the training error, 11.54% vs 10.8684%. It seems that the KNN model overfit a bit to the training subset despite the fact that the complexity of the KNN model seemed small, with the optimal KNN model using a relatively small K, (i.e. K = 5). In contrast, the training error rate on PCA Random Forest, PCA GBM, and Non-PCA GBM models were larger than their respective prediction error rates. (i.e. PCA RF: 3.34% vs 2.53%, PCA GBM: 18.42% vs 17.45%, Non-PCA GBM: 4.12% vs 3.96%). These three models do not seem to exhibit overfitting to the training subset. One would need to guage the effectiveness of the aforemention models over a larger test data set than the 30% of training data used for the out of sample validation subset. 
+
+Of the three models, Random Forest was able to achieve the best results on the reduced dimensioned PCA datasets. Stochastic Gradient Boosting did not perform well with the reduced dimension pca dataset but did provide better results with the original
+data sets. It seems that from the results of this experiment that an ensemble of weak learners requires more predictors for better performance. 
+
+## Test Cases Submission
+
+This section outputs the predictions by the random forest model for the 20 test cases to text files for submission to coursera.
+
+```{r cache = TRUE,results='hide',message=FALSE,warning=FALSE}
+#output classification to text file
+pml_write_files(rf.test.subset.pca.output)
+```
